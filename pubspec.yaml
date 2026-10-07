@@ -1,0 +1,26 @@
+name: volume_dock
+description: "Ad-free floating volume control for phones with broken volume keys."
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Draws a Flutter UI in a system overlay window above every other app,
+  # backed by a foreground service so Android keeps it alive.
+  flutter_overlay_window: ^0.4.0
+
+  # Reads, sets and listens to the media (STREAM_MUSIC) volume.
+  volume_controller: ^3.0.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
