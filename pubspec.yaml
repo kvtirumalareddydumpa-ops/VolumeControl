@@ -1,7 +1,7 @@
 name: volume_dock
-description: "Ad-free floating volume control for phones with broken volume keys."
+description: "Ad-free edge volume panel for phones with broken volume keys."
 publish_to: 'none'
-version: 1.0.0+1
+version: 2.0.0+2
 
 environment:
   sdk: ">=3.3.0 <4.0.0"
@@ -10,12 +10,17 @@ dependencies:
   flutter:
     sdk: flutter
 
-  # Draws a Flutter UI in a system overlay window above every other app,
-  # backed by a foreground service so Android keeps it alive.
-  flutter_overlay_window: ^0.4.0
+  # Draws a Flutter UI in a system overlay window above every other app.
+  flutter_overlay_window: ^0.4.4
 
-  # Reads, sets and listens to the media (STREAM_MUSIC) volume.
-  volume_controller: ^3.0.0
+  # Per-stream volume on Android: media, ring, notification, alarm.
+  flutter_volume_controller: ^2.0.2
+
+  # Remembers which edge the handle sits on and how high.
+  shared_preferences: ^2.2.0
+
+  # Opens the "Do Not Disturb access" settings screen.
+  android_intent_plus: ^5.0.0
 
 dev_dependencies:
   flutter_test:

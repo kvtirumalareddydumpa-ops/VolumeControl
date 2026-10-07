@@ -15,6 +15,10 @@
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.VIBRATE" />
 
+    <!-- Lets you grant "Do Not Disturb access" so ringtone/notification volume
+         can be changed while the phone is in silent or DND mode -->
+    <uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY" />
+
     <application
         android:label="Volume Dock"
         android:name="${applicationName}"

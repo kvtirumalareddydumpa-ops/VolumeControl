@@ -1,17 +1,23 @@
-// Volume Dock — an ad-free floating volume control for Android.
+// Volume Dock 2 — an ad-free edge volume panel for Android.
+//
+// A thin translucent handle sits on the edge of the screen. Swipe inward
+// (or tap it) and a translucent panel slides out with four sliders:
+// media, ringtone, notification and alarm.
 //
 // This file has two entry points:
-//   main()        -> the normal app: grant permission, start/stop the dock.
+//   main()        -> the normal app: permissions, handle position, on/off.
 //   overlayMain() -> runs in a separate Flutter engine inside the overlay
 //                    window that floats above every other app.
 
 import 'dart:async';
 import 'dart:math' as math;
 
+import 'package:android_intent_plus/android_intent.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_overlay_window/flutter_overlay_window.dart';
-import 'package:volume_controller/volume_controller.dart';
+import 'package:flutter_volume_controller/flutter_volume_controller.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Design tokens
@@ -20,33 +26,56 @@ import 'package:volume_controller/volume_controller.dart';
 class Dock {
   Dock._();
 
-  // Overlay window sizes, in dp. The bubble and the panel share one width so
-  // the window only ever grows vertically and never slides off the screen
-  // edge it is snapped to.
-  static const int windowWidth = 68;
-  static const int bubbleHeight = 68;
+  // Overlay window sizes, in dp.
+  static const int handleWidth = 22;
+  static const int handleHeight = 120;
+  static const int panelWidth = 320;
   static const int panelHeight = 380;
 
   static const Color background = Color(0xFF101319);
   static const Color surface = Color(0xFF1A1D25);
-  static const Color overlaySurface = Color(0xF21A1D25); // ~95% opaque
+  static const Color glass = Color(0xD9171A21); // translucent panel, ~85%
   static const Color raised = Color(0xFF242833);
-  static const Color track = Color(0xFF2A2F3B);
-  static const Color stroke = Color(0x1AFFFFFF);
-  static const Color textMuted = Color(0xFF9097A6);
+  static const Color track = Color(0x33FFFFFF);
+  static const Color stroke = Color(0x1FFFFFFF);
+  static const Color textMuted = Color(0xFF9AA1B0);
   static const Color accent = Color(0xFF9AA8FF); // periwinkle fill
   static const Color onAccent = Color(0xFF101319);
   static const Color ok = Color(0xFF7FD8A6);
   static const Color warn = Color(0xFFFFC27A);
 
-  static IconData iconFor(double v) {
-    if (v <= 0.001) return Icons.volume_off_rounded;
-    if (v < 0.34) return Icons.volume_mute_rounded;
-    if (v < 0.67) return Icons.volume_down_rounded;
-    return Icons.volume_up_rounded;
-  }
-
   static String percent(double v) => '${(v * 100).round()}%';
+}
+
+enum DockSide { left, right }
+
+/// The four Android volume streams shown in the panel.
+enum SoundChannel {
+  media('Media', AudioStream.music),
+  ring('Ringtone', AudioStream.ring),
+  notification('Notification', AudioStream.notification),
+  alarm('Alarm', AudioStream.alarm);
+
+  const SoundChannel(this.label, this.stream);
+
+  final String label;
+  final AudioStream stream;
+
+  IconData iconFor(double v) {
+    final silent = v <= 0.001;
+    return switch (this) {
+      SoundChannel.media =>
+        silent ? Icons.volume_off_rounded : Icons.music_note_rounded,
+      // Ringtone at zero puts the phone on vibrate.
+      SoundChannel.ring =>
+        silent ? Icons.vibration_rounded : Icons.ring_volume_rounded,
+      SoundChannel.notification => silent
+          ? Icons.notifications_off_rounded
+          : Icons.notifications_rounded,
+      SoundChannel.alarm =>
+        silent ? Icons.alarm_off_rounded : Icons.alarm_rounded,
+    };
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -72,46 +101,153 @@ void overlayMain() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Shared: volume syncing + the brightness-style slider
+//  Shared: settings, volume state, slider widgets
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Keeps a widget in sync with the system media volume, and pushes changes
-/// back without flooding the audio service while the user drags.
-class VolumeSync {
-  VolumeSync({required this.onSystemChange});
+/// Handle placement, saved on the phone so both the app and the overlay
+/// (which runs in its own engine) read the same values.
+class DockSettings {
+  const DockSettings({required this.side, required this.offset});
 
-  final ValueChanged<double> onSystemChange;
-  bool _userDragging = false;
-  double _lastSent = -1;
+  final DockSide side;
 
-  void start() {
-    // Don't pop the system volume dialog every time we change the level.
-    VolumeController.instance.showSystemUI = false;
-    VolumeController.instance.addListener(
-      (v) {
-        // Ignore echoes from the system while the finger is on the slider,
-        // otherwise the bar would jitter between finger and system steps.
-        if (!_userDragging) onSystemChange(v);
-      },
-      fetchInitialVolume: true,
+  /// Vertical offset of the handle from the middle of the screen, in dp.
+  /// Negative is higher, positive is lower.
+  final double offset;
+
+  static const _sideKey = 'dock_side';
+  static const _offsetKey = 'dock_offset';
+
+  static Future<DockSettings> load() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.reload(); // pick up changes written by the other engine
+    final side = prefs.getString(_sideKey) == 'left'
+        ? DockSide.left
+        : DockSide.right;
+    return DockSettings(side: side, offset: prefs.getDouble(_offsetKey) ?? 0);
+  }
+
+  Future<void> save() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_sideKey, side.name);
+    await prefs.setDouble(_offsetKey, offset);
+  }
+}
+
+/// Holds the level of all four streams, keeps them fresh while visible,
+/// and writes changes back without flooding the audio service.
+class MixerController extends ChangeNotifier {
+  final Map<SoundChannel, double> _values = {
+    for (final c in SoundChannel.values) c: 0.5,
+  };
+  final Map<SoundChannel, double> _lastSent = {};
+  final Set<SoundChannel> _blocked = {};
+  SoundChannel? _dragging;
+  Timer? _poll;
+  Timer? _noticeTimer;
+  bool _refreshing = false;
+  bool _disposed = false;
+
+  /// A short message shown in the panel, e.g. when DND blocks a change.
+  String? notice;
+
+  double valueOf(SoundChannel c) => _values[c] ?? 0;
+
+  /// Reads every stream from the system. The stream under the finger is
+  /// skipped so the slider doesn't jump back while you drag.
+  Future<void> refresh() async {
+    if (_refreshing || _disposed) return;
+    _refreshing = true;
+    var changed = false;
+    try {
+      for (final c in SoundChannel.values) {
+        if (c == _dragging) continue;
+        try {
+          final v = await FlutterVolumeController.getVolume(stream: c.stream);
+          if (v != null && (v - valueOf(c)).abs() > 0.001) {
+            _values[c] = v;
+            changed = true;
+          }
+        } catch (_) {
+          // Ignore a single failed read; the next poll will try again.
+        }
+      }
+    } finally {
+      _refreshing = false;
+    }
+    if (changed && !_disposed) notifyListeners();
+  }
+
+  /// Polling keeps all four bars in sync with changes made elsewhere,
+  /// e.g. ringtone and notification volume being linked on some phones.
+  void startPolling() {
+    _poll?.cancel();
+    _poll = Timer.periodic(
+      const Duration(milliseconds: 700),
+      (_) => refresh(),
     );
   }
 
-  Future<double> read() => VolumeController.instance.getVolume();
-
-  void beginDrag() => _userDragging = true;
-  void endDrag() => _userDragging = false;
-
-  void set(double value) {
-    final v = value.clamp(0.0, 1.0);
-    if (v == _lastSent) return;
-    final atEdge = v == 0.0 || v == 1.0;
-    if (!atEdge && (v - _lastSent).abs() < 0.01) return;
-    _lastSent = v;
-    VolumeController.instance.setVolume(v);
+  void stopPolling() {
+    _poll?.cancel();
+    _poll = null;
   }
 
-  void dispose() => VolumeController.instance.removeListener();
+  void beginDrag(SoundChannel c) => _dragging = c;
+
+  void endDrag(SoundChannel c) {
+    if (_dragging == c) _dragging = null;
+    if (_blocked.remove(c)) refresh();
+  }
+
+  void set(SoundChannel c, double value) {
+    if (_blocked.contains(c)) return;
+    final v = value.clamp(0.0, 1.0);
+    _values[c] = v;
+    notifyListeners();
+
+    final last = _lastSent[c] ?? -1;
+    if (v == last) return;
+    final atEdge = v == 0.0 || v == 1.0;
+    if (!atEdge && (v - last).abs() < 0.01) return;
+    _lastSent[c] = v;
+    _apply(c, v);
+  }
+
+  Future<void> _apply(SoundChannel c, double v) async {
+    try {
+      await FlutterVolumeController.setVolume(v, stream: c.stream);
+    } catch (_) {
+      // Android refuses ringtone/notification changes in silent or DND mode
+      // unless the app has "Do Not Disturb access".
+      _blocked.add(c);
+      _lastSent.remove(c);
+      _flash('${c.label} is locked by Do Not Disturb. '
+          'Allow access in the Volume Dock app.');
+      final dragging = _dragging;
+      _dragging = null;
+      await refresh();
+      _dragging = dragging;
+    }
+  }
+
+  void _flash(String message) {
+    notice = message;
+    notifyListeners();
+    _noticeTimer?.cancel();
+    _noticeTimer = Timer(const Duration(seconds: 4), () {
+      notice = null;
+      if (!_disposed) notifyListeners();
+    });
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    _poll?.cancel();
+    _noticeTimer?.cancel();
+    super.dispose();
+  }
 }
 
 /// A thick vertical pill that fills from the bottom, like the Android 12
@@ -121,14 +257,16 @@ class VolumeSlider extends StatefulWidget {
     super.key,
     required this.value,
     required this.onChanged,
+    required this.iconFor,
     this.onChangeStart,
     this.onChangeEnd,
-    this.width = 64,
-    this.radius = 24,
+    this.width = 52,
+    this.radius = 18,
   });
 
   final double value;
   final ValueChanged<double> onChanged;
+  final IconData Function(double value) iconFor;
   final VoidCallback? onChangeStart;
   final VoidCallback? onChangeEnd;
   final double width;
@@ -183,7 +321,7 @@ class _VolumeSliderState extends State<VolumeSlider> {
           },
           onTapUp: (_) => widget.onChangeEnd?.call(),
           child: AnimatedScale(
-            scale: _dragging ? 1.03 : 1.0,
+            scale: _dragging ? 1.04 : 1.0,
             duration: const Duration(milliseconds: 160),
             curve: Curves.easeOut,
             child: TweenAnimationBuilder<double>(
@@ -224,7 +362,7 @@ class _VolumeSliderState extends State<VolumeSlider> {
               Positioned(
                 left: 0,
                 right: 0,
-                bottom: math.max(fillHeight - 14, 0),
+                bottom: math.max(fillHeight - 14, 0.0),
                 child: Center(
                   child: Container(
                     width: widget.width * 0.36,
@@ -241,14 +379,94 @@ class _VolumeSliderState extends State<VolumeSlider> {
               right: 0,
               bottom: 14,
               child: Icon(
-                Dock.iconFor(v),
-                size: 24,
+                widget.iconFor(v),
+                size: 22,
                 color: iconOnFill ? Dock.onAccent : Colors.white,
               ),
             ),
           ],
         ),
       ),
+    );
+  }
+}
+
+/// Four sliders side by side: media, ringtone, notification, alarm.
+class MixerRow extends StatelessWidget {
+  const MixerRow({
+    super.key,
+    required this.mixer,
+    this.sliderWidth = 50,
+    this.onActivity,
+  });
+
+  final MixerController mixer;
+  final double sliderWidth;
+
+  /// true when a finger goes down on a slider, false when it lifts.
+  final ValueChanged<bool>? onActivity;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: mixer,
+      builder: (context, _) => Row(
+        children: [
+          for (final (i, c) in SoundChannel.values.indexed) ...[
+            if (i > 0) const SizedBox(width: 8),
+            Expanded(child: _channel(c)),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _channel(SoundChannel c) {
+    final v = mixer.valueOf(c);
+    return Column(
+      children: [
+        Text(
+          Dock.percent(v),
+          style: const TextStyle(
+            color: Dock.textMuted,
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+            fontFeatures: [FontFeature.tabularFigures()],
+          ),
+        ),
+        const SizedBox(height: 8),
+        Expanded(
+          child: VolumeSlider(
+            value: v,
+            width: sliderWidth,
+            iconFor: c.iconFor,
+            onChangeStart: () {
+              mixer.beginDrag(c);
+              onActivity?.call(true);
+            },
+            onChanged: (x) => mixer.set(c, x),
+            onChangeEnd: () {
+              mixer.endDrag(c);
+              onActivity?.call(false);
+            },
+          ),
+        ),
+        const SizedBox(height: 10),
+        SizedBox(
+          height: 16,
+          child: FittedBox(
+            fit: BoxFit.scaleDown,
+            child: Text(
+              c.label,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 12,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ),
+        ),
+      ],
     );
   }
 }
@@ -276,7 +494,7 @@ class _PressableState extends State<_Pressable> {
       onTapCancel: () => setState(() => _down = false),
       onTap: widget.onTap,
       child: AnimatedScale(
-        scale: _down ? 0.9 : 1.0,
+        scale: _down ? 0.88 : 1.0,
         duration: const Duration(milliseconds: 120),
         curve: Curves.easeOut,
         child: widget.child,
@@ -286,7 +504,7 @@ class _PressableState extends State<_Pressable> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  PART 1 — Main app: permission + start/stop the dock
+//  PART 1 — Main app: permissions, handle placement, on/off
 // ═══════════════════════════════════════════════════════════════════════════
 
 class VolumeDockApp extends StatelessWidget {
@@ -316,13 +534,11 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
-  late final VolumeSync _sync = VolumeSync(
-    onSystemChange: (v) {
-      if (mounted) setState(() => _volume = v);
-    },
-  );
+  final MixerController _mixer = MixerController();
 
-  double _volume = 0.5;
+  DockSide _side = DockSide.right;
+  double _offset = 0;
+  double _maxOffset = 200;
   bool _hasPermission = false;
   bool _dockRunning = false;
   bool _busy = false;
@@ -331,22 +547,42 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _sync.start();
+    FlutterVolumeController.updateShowSystemUI(false);
+    _mixer.refresh();
+    _mixer.startPolling();
+    _loadSettings();
     _refreshStatus();
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _sync.dispose();
+    _mixer.dispose();
     super.dispose();
   }
 
-  // Coming back from the Settings screen? Re-check the permission.
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) _refreshStatus();
+    if (state == AppLifecycleState.resumed) {
+      _refreshStatus(); // e.g. coming back from the permission screen
+      _mixer.refresh();
+      _mixer.startPolling();
+    } else if (state == AppLifecycleState.paused) {
+      _mixer.stopPolling();
+    }
   }
+
+  Future<void> _loadSettings() async {
+    final s = await DockSettings.load();
+    if (!mounted) return;
+    setState(() {
+      _side = s.side;
+      _offset = s.offset;
+    });
+  }
+
+  Future<void> _saveSettings() =>
+      DockSettings(side: _side, offset: _offset).save();
 
   Future<void> _refreshStatus() async {
     final granted = await FlutterOverlayWindow.isPermissionGranted();
@@ -358,30 +594,42 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     });
   }
 
-  Future<void> _grantPermission() async {
+  Future<void> _grantOverlay() async {
     await FlutterOverlayWindow.requestPermission();
     await _refreshStatus();
   }
 
-  Future<void> _toggleDock() async {
+  Future<void> _openDndAccess() async {
+    const intent = AndroidIntent(
+      action: 'android.settings.NOTIFICATION_POLICY_ACCESS_SETTINGS',
+    );
+    await intent.launch();
+  }
+
+  Future<void> _showDock() async {
+    await _saveSettings(); // the overlay reads the side from here
+    await FlutterOverlayWindow.showOverlay(
+      width: Dock.handleWidth,
+      height: Dock.handleHeight,
+      alignment: _side == DockSide.right
+          ? OverlayAlignment.centerRight
+          : OverlayAlignment.centerLeft,
+      // Pinned flush to the edge: no free dragging, no half-hidden snapping.
+      enableDrag: false,
+      positionGravity: PositionGravity.none,
+      startPosition: OverlayPosition(0, _offset.clamp(-_maxOffset, _maxOffset)),
+      flag: OverlayFlag.defaultFlag, // touches outside pass through
+      visibility: NotificationVisibility.visibilityPublic,
+      overlayTitle: 'Volume Dock',
+      overlayContent: 'Swipe the edge handle to change volume',
+    );
+  }
+
+  Future<void> _withBusy(Future<void> Function() action) async {
     if (_busy) return;
     setState(() => _busy = true);
     try {
-      if (_dockRunning) {
-        await FlutterOverlayWindow.closeOverlay();
-      } else {
-        await FlutterOverlayWindow.showOverlay(
-          width: Dock.windowWidth,
-          height: Dock.bubbleHeight,
-          alignment: OverlayAlignment.centerRight,
-          positionGravity: PositionGravity.auto, // snap to nearest edge
-          enableDrag: true,
-          flag: OverlayFlag.defaultFlag, // touches outside pass through
-          visibility: NotificationVisibility.visibilityPublic,
-          overlayTitle: 'Volume Dock',
-          overlayContent: 'Floating volume control is on',
-        );
-      }
+      await action();
       await Future<void>.delayed(const Duration(milliseconds: 300));
     } finally {
       await _refreshStatus();
@@ -389,9 +637,34 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _toggleDock() => _withBusy(() async {
+        if (_dockRunning) {
+          await FlutterOverlayWindow.closeOverlay();
+        } else {
+          await _showDock();
+        }
+      });
+
+  /// Placement changes apply by restarting the handle in its new spot.
+  Future<void> _applyPlacement() async {
+    await _saveSettings();
+    if (!_dockRunning) return;
+    await _withBusy(() async {
+      await FlutterOverlayWindow.closeOverlay();
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+      await _showDock();
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     final text = Theme.of(context).textTheme;
+    // Keep the open panel fully on screen wherever the handle sits.
+    _maxOffset = math.max(
+      0.0,
+      MediaQuery.sizeOf(context).height / 2 - Dock.panelHeight / 2 - 24,
+    );
+
     return Scaffold(
       body: SafeArea(
         child: ListView(
@@ -406,58 +679,36 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             ),
             const SizedBox(height: 6),
             Text(
-              'A floating volume slider for when the buttons stop working.',
+              'Swipe the handle on the edge of your screen to open these '
+              'sliders over any app.',
               style: text.bodyMedium?.copyWith(color: Dock.textMuted),
             ),
             const SizedBox(height: 24),
 
-            // Live preview: the same slider the dock uses.
+            // Live preview: the same sliders the panel uses.
             _Section(
-              padding: const EdgeInsets.all(20),
-              child: Row(
+              padding: const EdgeInsets.fromLTRB(16, 18, 16, 16),
+              child: Column(
                 children: [
                   SizedBox(
-                    height: 220,
-                    child: VolumeSlider(
-                      value: _volume,
-                      width: 72,
-                      radius: 26,
-                      onChangeStart: _sync.beginDrag,
-                      onChangeEnd: _sync.endDrag,
-                      onChanged: (v) {
-                        setState(() => _volume = v);
-                        _sync.set(v);
-                      },
-                    ),
+                    height: 280,
+                    child: MixerRow(mixer: _mixer, sliderWidth: 54),
                   ),
-                  const SizedBox(width: 24),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          Dock.percent(_volume),
-                          style: text.displaySmall?.copyWith(
-                            fontWeight: FontWeight.w700,
-                            fontFeatures: const [FontFeature.tabularFigures()],
+                  ListenableBuilder(
+                    listenable: _mixer,
+                    builder: (context, _) => _mixer.notice == null
+                        ? const SizedBox.shrink()
+                        : Padding(
+                            padding: const EdgeInsets.only(top: 12),
+                            child: Text(
+                              _mixer.notice!,
+                              textAlign: TextAlign.center,
+                              style: const TextStyle(
+                                color: Dock.warn,
+                                fontSize: 12,
+                              ),
+                            ),
                           ),
-                        ),
-                        Text(
-                          'Media volume',
-                          style: text.titleSmall
-                              ?.copyWith(color: Dock.textMuted),
-                        ),
-                        const SizedBox(height: 16),
-                        Text(
-                          'Drag the bar to try it. The floating dock works '
-                          'the same way, over any app.',
-                          style: text.bodySmall?.copyWith(
-                            color: Dock.textMuted,
-                            height: 1.4,
-                          ),
-                        ),
-                      ],
-                    ),
                   ),
                 ],
               ),
@@ -475,7 +726,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   ),
                   const Divider(height: 1, color: Dock.stroke),
                   _StatusRow(
-                    label: 'Floating dock',
+                    label: 'Edge handle',
                     ok: _dockRunning,
                     okText: 'On',
                     badText: 'Off',
@@ -489,33 +740,118 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               _BigButton(
                 icon: Icons.layers_rounded,
                 label: 'Allow display over other apps',
-                onPressed: _grantPermission,
+                onPressed: _grantOverlay,
               )
             else
               _BigButton(
                 icon: _dockRunning
                     ? Icons.stop_circle_outlined
                     : Icons.play_circle_outline_rounded,
-                label: _dockRunning ? 'Turn off dock' : 'Turn on dock',
+                label: _dockRunning ? 'Turn off edge handle' : 'Turn on edge handle',
                 tonal: _dockRunning,
                 busy: _busy,
                 onPressed: _toggleDock,
               ),
-            const SizedBox(height: 24),
+            const SizedBox(height: 20),
+
+            // Handle placement
+            _Section(
+              padding: const EdgeInsets.fromLTRB(18, 18, 18, 10),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Handle position', style: text.titleSmall),
+                  const SizedBox(height: 4),
+                  Text(
+                    'realme\'s Smart Sidebar uses the left edge, so the right '
+                    'edge avoids clashing with it.',
+                    style: text.bodySmall?.copyWith(color: Dock.textMuted),
+                  ),
+                  const SizedBox(height: 14),
+                  SizedBox(
+                    width: double.infinity,
+                    child: SegmentedButton<DockSide>(
+                      segments: const [
+                        ButtonSegment(
+                          value: DockSide.left,
+                          label: Text('Left edge'),
+                          icon: Icon(Icons.align_horizontal_left_rounded),
+                        ),
+                        ButtonSegment(
+                          value: DockSide.right,
+                          label: Text('Right edge'),
+                          icon: Icon(Icons.align_horizontal_right_rounded),
+                        ),
+                      ],
+                      selected: {_side},
+                      onSelectionChanged: (s) {
+                        setState(() => _side = s.first);
+                        _applyPlacement();
+                      },
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      Text('Higher',
+                          style: text.bodySmall?.copyWith(color: Dock.textMuted)),
+                      Expanded(
+                        child: Slider(
+                          min: -_maxOffset,
+                          max: _maxOffset,
+                          value: _offset.clamp(-_maxOffset, _maxOffset),
+                          onChanged: (v) => setState(() => _offset = v),
+                          onChangeEnd: (_) => _applyPlacement(),
+                        ),
+                      ),
+                      Text('Lower',
+                          style: text.bodySmall?.copyWith(color: Dock.textMuted)),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+
+            // Do Not Disturb access
+            _Section(
+              padding: const EdgeInsets.all(18),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Ringtone in silent mode', style: text.titleSmall),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Android blocks apps from changing ringtone and '
+                    'notification volume while the phone is silent or on Do '
+                    'Not Disturb, unless you allow it.',
+                    style: text.bodySmall
+                        ?.copyWith(color: Dock.textMuted, height: 1.4),
+                  ),
+                  const SizedBox(height: 12),
+                  OutlinedButton.icon(
+                    onPressed: _openDndAccess,
+                    icon: const Icon(Icons.do_not_disturb_on_outlined),
+                    label: const Text('Allow Do Not Disturb access'),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
 
             _Section(
               padding: const EdgeInsets.all(18),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text('Using the dock', style: text.titleSmall),
+                  Text('Using the handle', style: text.titleSmall),
                   const SizedBox(height: 10),
-                  const _Tip('Drag the bubble to move it. Let go and it '
-                      'snaps to the nearest edge.'),
-                  const _Tip('Tap the bubble to open the slider. It '
-                      'tucks itself away after 4 seconds.'),
-                  const _Tip('The power icon in the panel turns the '
-                      'dock off.'),
+                  const _Tip('Swipe inward from the handle, or tap it, to '
+                      'open the panel.'),
+                  const _Tip('Swipe the panel back toward the edge to close '
+                      'it. It also closes by itself after 5 seconds.'),
+                  const _Tip('The power icon in the panel turns the handle '
+                      'off.'),
                   const SizedBox(height: 14),
                   Text('Keep it alive on realme UI', style: text.titleSmall),
                   const SizedBox(height: 10),
@@ -609,15 +945,14 @@ class _BigButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final style = FilledButton.styleFrom(
-      minimumSize: const Size.fromHeight(58),
-      backgroundColor: tonal ? Dock.raised : Dock.accent,
-      foregroundColor: tonal ? Colors.white : Dock.onAccent,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-      textStyle: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
-    );
     return FilledButton.icon(
-      style: style,
+      style: FilledButton.styleFrom(
+        minimumSize: const Size.fromHeight(58),
+        backgroundColor: tonal ? Dock.raised : Dock.accent,
+        foregroundColor: tonal ? Colors.white : Dock.onAccent,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        textStyle: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+      ),
       onPressed: busy ? null : onPressed,
       icon: busy
           ? const SizedBox(
@@ -672,7 +1007,7 @@ class _Tip extends StatelessWidget {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  PART 2 — Overlay UI: draggable bubble ⇄ expanded vertical slider panel
+//  PART 2 — Overlay UI: edge handle ⇄ translucent sound panel
 // ═══════════════════════════════════════════════════════════════════════════
 
 class VolumeOverlay extends StatefulWidget {
@@ -683,16 +1018,10 @@ class VolumeOverlay extends StatefulWidget {
 }
 
 class _VolumeOverlayState extends State<VolumeOverlay> {
-  static const _autoMinimizeAfter = Duration(seconds: 4);
-  static const _step = 1 / 15; // Android's default media volume step count
+  static const _autoHideAfter = Duration(seconds: 5);
 
-  late final VolumeSync _sync = VolumeSync(
-    onSystemChange: (v) {
-      if (mounted) setState(() => _volume = v);
-    },
-  );
-
-  double _volume = 0.5;
+  final MixerController _mixer = MixerController();
+  DockSide _side = DockSide.right;
   bool _expanded = false;
   bool _resizing = false;
   Timer? _idleTimer;
@@ -700,59 +1029,64 @@ class _VolumeOverlayState extends State<VolumeOverlay> {
   @override
   void initState() {
     super.initState();
-    _sync.start();
+    FlutterVolumeController.updateShowSystemUI(false);
+    _loadSide();
+  }
+
+  Future<void> _loadSide() async {
+    final s = await DockSettings.load();
+    if (mounted) setState(() => _side = s.side);
   }
 
   @override
   void dispose() {
     _idleTimer?.cancel();
-    _sync.dispose();
+    _mixer.dispose();
     super.dispose();
   }
 
-  // Grow the window first, then show the panel inside it. Dragging the
-  // window is switched off while open so the slider gets the vertical drags.
-  Future<void> _expand() async {
+  // Read the levels, grow the window inward from the edge, then show the
+  // panel inside it.
+  Future<void> _open() async {
     if (_expanded || _resizing) return;
     _resizing = true;
     HapticFeedback.lightImpact();
     try {
+      await _mixer.refresh();
       await FlutterOverlayWindow.resizeOverlay(
-        Dock.windowWidth,
+        Dock.panelWidth,
         Dock.panelHeight,
         false,
       );
-      final v = await _sync.read();
       if (!mounted) return;
-      setState(() {
-        _volume = v;
-        _expanded = true;
-      });
+      setState(() => _expanded = true);
+      _mixer.startPolling();
       _armIdleTimer();
     } finally {
       _resizing = false;
     }
   }
 
-  // Animate the panel out first, then shrink the window back to the bubble.
-  Future<void> _minimize() async {
+  // Slide the panel out first, then shrink the window back to the handle.
+  Future<void> _hide() async {
     if (!_expanded || _resizing) return;
     _resizing = true;
     _idleTimer?.cancel();
+    _mixer.stopPolling();
     try {
       setState(() => _expanded = false);
-      await Future<void>.delayed(const Duration(milliseconds: 200));
+      await Future<void>.delayed(const Duration(milliseconds: 240));
       await FlutterOverlayWindow.resizeOverlay(
-        Dock.windowWidth,
-        Dock.bubbleHeight,
-        true,
+        Dock.handleWidth,
+        Dock.handleHeight,
+        false,
       );
     } finally {
       _resizing = false;
     }
   }
 
-  Future<void> _close() async {
+  Future<void> _turnOff() async {
     _idleTimer?.cancel();
     HapticFeedback.mediumImpact();
     await FlutterOverlayWindow.closeOverlay();
@@ -760,72 +1094,69 @@ class _VolumeOverlayState extends State<VolumeOverlay> {
 
   void _armIdleTimer() {
     _idleTimer?.cancel();
-    _idleTimer = Timer(_autoMinimizeAfter, _minimize);
+    _idleTimer = Timer(_autoHideAfter, _hide);
   }
 
-  void _onSliderStart() {
-    _idleTimer?.cancel();
-    _sync.beginDrag();
-  }
-
-  void _onSliderChanged(double v) {
-    setState(() => _volume = v);
-    _sync.set(v);
-  }
-
-  void _onSliderEnd() {
-    _sync.endDrag();
-    _armIdleTimer();
-  }
-
-  void _nudge(int direction) {
-    final stepped = ((_volume / _step).round() + direction) * _step;
-    final v = stepped.clamp(0.0, 1.0);
-    HapticFeedback.selectionClick();
-    setState(() => _volume = v);
-    _sync.set(v);
-    _armIdleTimer();
+  void _onActivity(bool active) {
+    if (active) {
+      _idleTimer?.cancel();
+    } else {
+      _armIdleTimer();
+    }
   }
 
   @override
   Widget build(BuildContext context) {
+    final edge = _side == DockSide.right
+        ? Alignment.centerRight
+        : Alignment.centerLeft;
+
     return Material(
       type: MaterialType.transparency,
       child: LayoutBuilder(
         builder: (context, constraints) {
           // Only show the panel once the window has actually grown, so it
           // never renders squashed during the resize.
-          final showPanel =
-              _expanded && constraints.maxHeight >= Dock.panelHeight * 0.85;
+          final showPanel = _expanded &&
+              constraints.maxWidth >= Dock.panelWidth * 0.85 &&
+              constraints.maxHeight >= Dock.panelHeight * 0.85;
 
           return AnimatedSwitcher(
-            duration: const Duration(milliseconds: 200),
+            duration: const Duration(milliseconds: 240),
             switchInCurve: Curves.easeOutCubic,
             switchOutCurve: Curves.easeInCubic,
-            transitionBuilder: (child, anim) => FadeTransition(
-              opacity: anim,
-              child: ScaleTransition(
-                scale: Tween<double>(begin: 0.9, end: 1).animate(anim),
-                child: child,
-              ),
+            layoutBuilder: (current, previous) => Stack(
+              alignment: edge,
+              children: [...previous, if (current != null) current],
             ),
+            transitionBuilder: (child, anim) {
+              final dx = _side == DockSide.right ? 0.2 : -0.2;
+              return FadeTransition(
+                opacity: anim,
+                child: SlideTransition(
+                  position: Tween<Offset>(
+                    begin: Offset(dx, 0),
+                    end: Offset.zero,
+                  ).animate(anim),
+                  child: child,
+                ),
+              );
+            },
             child: showPanel
                 ? SizedBox.expand(
                     key: const ValueKey('panel'),
-                    child: _DockPanel(
-                      volume: _volume,
-                      onChangeStart: _onSliderStart,
-                      onChanged: _onSliderChanged,
-                      onChangeEnd: _onSliderEnd,
-                      onUp: () => _nudge(1),
-                      onDown: () => _nudge(-1),
-                      onMinimize: _minimize,
-                      onClose: _close,
+                    child: _SoundPanel(
+                      mixer: _mixer,
+                      side: _side,
+                      onActivity: _onActivity,
+                      onHide: _hide,
+                      onTurnOff: _turnOff,
                     ),
                   )
-                : Center(
-                    key: const ValueKey('bubble'),
-                    child: _DockBubble(volume: _volume, onTap: _expand),
+                : Align(
+                    key: const ValueKey('handle'),
+                    alignment: edge,
+                    child: _EdgeHandle(side: _side, onOpen: _open),
                   ),
           );
         },
@@ -834,142 +1165,160 @@ class _VolumeOverlayState extends State<VolumeOverlay> {
   }
 }
 
-/// Collapsed state: a compact bubble with a ring showing the current level.
-/// The window itself is dragged natively by flutter_overlay_window.
-class _DockBubble extends StatelessWidget {
-  const _DockBubble({required this.volume, required this.onTap});
+/// The thin translucent bar on the screen edge. Swipe inward or tap.
+class _EdgeHandle extends StatefulWidget {
+  const _EdgeHandle({required this.side, required this.onOpen});
 
-  final double volume;
-  final VoidCallback onTap;
+  final DockSide side;
+  final VoidCallback onOpen;
+
+  @override
+  State<_EdgeHandle> createState() => _EdgeHandleState();
+}
+
+class _EdgeHandleState extends State<_EdgeHandle> {
+  double _dx = 0;
+  bool _active = false;
+  bool _fired = false;
+
+  void _setActive(bool v) {
+    if (_active != v) setState(() => _active = v);
+  }
 
   @override
   Widget build(BuildContext context) {
-    return _Pressable(
-      onTap: onTap,
-      child: Container(
-        width: 60,
-        height: 60,
-        decoration: BoxDecoration(
-          color: Dock.overlaySurface,
-          borderRadius: BorderRadius.circular(22),
-          border: Border.all(color: Dock.stroke),
-        ),
-        child: Stack(
-          alignment: Alignment.center,
-          children: [
-            SizedBox(
-              width: 40,
-              height: 40,
-              child: TweenAnimationBuilder<double>(
-                tween: Tween(end: volume),
-                duration: const Duration(milliseconds: 240),
-                curve: Curves.easeOutCubic,
-                builder: (context, v, _) => CircularProgressIndicator(
-                  value: v,
-                  strokeWidth: 3.5,
-                  strokeCap: StrokeCap.round,
-                  backgroundColor: Dock.track,
-                  valueColor: const AlwaysStoppedAnimation(Dock.accent),
-                ),
+    final onRight = widget.side == DockSide.right;
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTapDown: (_) => _setActive(true),
+      onTapCancel: () => _setActive(false),
+      onTap: () {
+        _setActive(false);
+        widget.onOpen();
+      },
+      onHorizontalDragStart: (_) {
+        _dx = 0;
+        _fired = false;
+        _setActive(true);
+      },
+      onHorizontalDragUpdate: (d) {
+        _dx += d.delta.dx;
+        final inward = onRight ? -_dx : _dx;
+        if (!_fired && inward > 10) {
+          _fired = true;
+          widget.onOpen();
+        }
+      },
+      onHorizontalDragEnd: (_) => _setActive(false),
+      onHorizontalDragCancel: () => _setActive(false),
+      child: SizedBox(
+        width: Dock.handleWidth.toDouble(),
+        height: Dock.handleHeight.toDouble(),
+        child: Align(
+          alignment: onRight ? Alignment.centerRight : Alignment.centerLeft,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 4),
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 150),
+              curve: Curves.easeOut,
+              width: _active ? 7 : 5,
+              height: _active ? 104 : 92,
+              decoration: BoxDecoration(
+                color: _active ? const Color(0xD9FFFFFF) : const Color(0x8CFFFFFF),
+                borderRadius: BorderRadius.circular(4),
+                // A faint dark outline keeps it visible on white screens.
+                border: Border.all(color: const Color(0x33000000), width: 0.5),
               ),
             ),
-            Icon(Dock.iconFor(volume), size: 18, color: Colors.white),
-          ],
+          ),
         ),
       ),
     );
   }
 }
 
-/// Expanded state: level readout, step buttons and the big slider.
-class _DockPanel extends StatelessWidget {
-  const _DockPanel({
-    required this.volume,
-    required this.onChangeStart,
-    required this.onChanged,
-    required this.onChangeEnd,
-    required this.onUp,
-    required this.onDown,
-    required this.onMinimize,
-    required this.onClose,
+/// The translucent panel with the four sliders.
+class _SoundPanel extends StatelessWidget {
+  const _SoundPanel({
+    required this.mixer,
+    required this.side,
+    required this.onActivity,
+    required this.onHide,
+    required this.onTurnOff,
   });
 
-  final double volume;
-  final VoidCallback onChangeStart;
-  final ValueChanged<double> onChanged;
-  final VoidCallback onChangeEnd;
-  final VoidCallback onUp;
-  final VoidCallback onDown;
-  final VoidCallback onMinimize;
-  final VoidCallback onClose;
+  final MixerController mixer;
+  final DockSide side;
+  final ValueChanged<bool> onActivity;
+  final VoidCallback onHide;
+  final VoidCallback onTurnOff;
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.fromLTRB(8, 12, 8, 8),
-      decoration: BoxDecoration(
-        color: Dock.overlaySurface,
-        borderRadius: BorderRadius.circular(32),
-        border: Border.all(color: Dock.stroke),
-      ),
-      child: Column(
-        children: [
-          Text(
-            Dock.percent(volume),
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 13,
-              fontWeight: FontWeight.w700,
-              fontFeatures: [FontFeature.tabularFigures()],
-            ),
-          ),
-          const SizedBox(height: 8),
-          _StepButton(icon: Icons.add_rounded, onTap: onUp),
-          const SizedBox(height: 8),
-          Expanded(
-            child: VolumeSlider(
-              value: volume,
-              width: 48,
-              radius: 18,
-              onChangeStart: onChangeStart,
-              onChanged: onChanged,
-              onChangeEnd: onChangeEnd,
-            ),
-          ),
-          const SizedBox(height: 8),
-          _StepButton(icon: Icons.remove_rounded, onTap: onDown),
-          const SizedBox(height: 6),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-            children: [
-              _TinyIcon(icon: Icons.power_settings_new_rounded, onTap: onClose),
-              _TinyIcon(icon: Icons.keyboard_arrow_down_rounded, onTap: onMinimize),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _StepButton extends StatelessWidget {
-  const _StepButton({required this.icon, required this.onTap});
-
-  final IconData icon;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    return _Pressable(
-      onTap: onTap,
+    final onRight = side == DockSide.right;
+    return GestureDetector(
+      // Fling the panel back toward its edge to close it.
+      onHorizontalDragEnd: (d) {
+        final v = d.primaryVelocity ?? 0;
+        if ((onRight && v > 250) || (!onRight && v < -250)) onHide();
+      },
       child: Container(
-        width: 48,
-        height: 34,
+        margin: EdgeInsets.only(left: onRight ? 0 : 8, right: onRight ? 8 : 0),
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
         decoration: BoxDecoration(
-          color: Dock.raised,
-          borderRadius: BorderRadius.circular(14),
+          color: Dock.glass,
+          borderRadius: BorderRadius.circular(28),
+          border: Border.all(color: Dock.stroke),
         ),
-        child: Icon(icon, size: 20, color: Colors.white),
+        child: Column(
+          children: [
+            Row(
+              children: [
+                const Text(
+                  'Sound',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 15,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const Spacer(),
+                _TinyIcon(
+                  icon: Icons.power_settings_new_rounded,
+                  onTap: onTurnOff,
+                ),
+                const SizedBox(width: 4),
+                _TinyIcon(
+                  icon: onRight
+                      ? Icons.chevron_right_rounded
+                      : Icons.chevron_left_rounded,
+                  onTap: onHide,
+                ),
+              ],
+            ),
+            ListenableBuilder(
+              listenable: mixer,
+              builder: (context, _) => mixer.notice == null
+                  ? const SizedBox(height: 10)
+                  : Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 6),
+                      child: Text(
+                        mixer.notice!,
+                        maxLines: 2,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(color: Dock.warn, fontSize: 11),
+                      ),
+                    ),
+            ),
+            Expanded(
+              child: MixerRow(
+                mixer: mixer,
+                sliderWidth: 50,
+                onActivity: onActivity,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -985,10 +1334,14 @@ class _TinyIcon extends StatelessWidget {
   Widget build(BuildContext context) {
     return _Pressable(
       onTap: onTap,
-      child: SizedBox(
-        width: 24,
-        height: 28,
-        child: Icon(icon, size: 18, color: Dock.textMuted),
+      child: Container(
+        width: 34,
+        height: 34,
+        decoration: const BoxDecoration(
+          color: Color(0x14FFFFFF),
+          shape: BoxShape.circle,
+        ),
+        child: Icon(icon, size: 20, color: Colors.white),
       ),
     );
   }
