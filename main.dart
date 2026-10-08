@@ -608,12 +608,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _showDock() async {
+    // Read the pixel ratio before any await, while context is safe to use.
+    final dpr = MediaQuery.devicePixelRatioOf(context);
     // The overlay reads side + height from here and positions itself.
     _offset = _offset.clamp(-_maxOffset, _maxOffset);
     await _saveSettings();
+    // showOverlay takes raw pixels on this plugin version, so convert from dp.
+    // (The overlay double-checks its real size on start and corrects it.)
     await FlutterOverlayWindow.showOverlay(
-      width: Dock.handleWidth,
-      height: Dock.handleHeight,
+      width: (Dock.handleWidth * dpr).round(),
+      height: (Dock.handleHeight * dpr).round(),
       alignment: _side == DockSide.right
           ? OverlayAlignment.centerRight
           : OverlayAlignment.centerLeft,
@@ -1042,30 +1046,73 @@ class _VolumeOverlayState extends State<VolumeOverlay> {
   bool _pulse = true; // glow briefly on start so the handle is easy to spot
   Timer? _idleTimer;
 
+  /// The window's real size in dp, as Flutter sees it.
+  Size _window = Size.zero;
+
+  /// Multiplier from dp to whatever unit resizeOverlay/moveOverlay expect.
+  /// 1.0 if the plugin takes dp, the pixel ratio (~2.75 on a realme X3)
+  /// if it takes raw pixels. Measured on start rather than guessed.
+  double _unit = 1.0;
+
   @override
   void initState() {
     super.initState();
     FlutterVolumeController.updateShowSystemUI(false);
-    _loadSettings();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _setUp());
+  }
+
+  Future<void> _setUp() async {
+    final s = await DockSettings.load();
+    if (mounted) setState(() => _side = s.side);
+
+    await _calibrate();
+
+    // Only move when a custom height was chosen; otherwise stay centred on
+    // the edge, which is where the window opens by default.
+    if (s.offset.abs() > 1) {
+      try {
+        await FlutterOverlayWindow.moveOverlay(
+          OverlayPosition(0, s.offset * _unit),
+        );
+      } catch (_) {
+        // If moving fails, the handle simply stays in the middle.
+      }
+    }
+
     Timer(const Duration(milliseconds: 1600), () {
       if (mounted) setState(() => _pulse = false);
     });
   }
 
-  Future<void> _loadSettings() async {
-    final s = await DockSettings.load();
-    if (!mounted) return;
-    setState(() => _side = s.side);
-    // Only move when a custom height was chosen; otherwise stay centred on
-    // the edge, which is where the window opens by default.
-    if (s.offset.abs() > 1) {
-      try {
-        await FlutterOverlayWindow.moveOverlay(OverlayPosition(0, s.offset));
-      } catch (_) {
-        // If moving fails, the handle simply stays in the middle.
+  /// Ask for the handle size in dp, see what size we actually get, and
+  /// work out the plugin's unit from the difference.
+  Future<void> _calibrate() async {
+    try {
+      await FlutterOverlayWindow.resizeOverlay(
+        Dock.handleWidth,
+        Dock.handleHeight,
+        false,
+      );
+      // Wait (up to ~1s) for the new size to reach Flutter.
+      for (var i = 0; i < 10; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+        if ((_window.height - Dock.handleHeight).abs() < 4) return; // dp
       }
+      if (_window.height > 1) {
+        _unit = Dock.handleHeight / _window.height; // pixels
+        await _resizeTo(Dock.handleWidth, Dock.handleHeight);
+      }
+    } catch (_) {
+      // Keep whatever size we have; better than no handle at all.
     }
   }
+
+  Future<void> _resizeTo(int widthDp, int heightDp) =>
+      FlutterOverlayWindow.resizeOverlay(
+        (widthDp * _unit).round(),
+        (heightDp * _unit).round(),
+        false,
+      );
 
   @override
   void dispose() {
@@ -1082,11 +1129,7 @@ class _VolumeOverlayState extends State<VolumeOverlay> {
     HapticFeedback.lightImpact();
     try {
       await _mixer.refresh();
-      await FlutterOverlayWindow.resizeOverlay(
-        Dock.panelWidth,
-        Dock.panelHeight,
-        false,
-      );
+      await _resizeTo(Dock.panelWidth, Dock.panelHeight);
       if (!mounted) return;
       setState(() => _expanded = true);
       _mixer.startPolling();
@@ -1105,11 +1148,7 @@ class _VolumeOverlayState extends State<VolumeOverlay> {
     try {
       setState(() => _expanded = false);
       await Future<void>.delayed(const Duration(milliseconds: 240));
-      await FlutterOverlayWindow.resizeOverlay(
-        Dock.handleWidth,
-        Dock.handleHeight,
-        false,
-      );
+      await _resizeTo(Dock.handleWidth, Dock.handleHeight);
     } finally {
       _resizing = false;
     }
@@ -1144,6 +1183,7 @@ class _VolumeOverlayState extends State<VolumeOverlay> {
       type: MaterialType.transparency,
       child: LayoutBuilder(
         builder: (context, constraints) {
+          _window = constraints.biggest;
           // Only show the panel once the window has actually grown, so it
           // never renders squashed during the resize.
           final showPanel = _expanded &&
@@ -1256,7 +1296,7 @@ class _EdgeHandleState extends State<_EdgeHandle> {
         child: Align(
           alignment: onRight ? Alignment.centerRight : Alignment.centerLeft,
           child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 4),
+            padding: const EdgeInsets.symmetric(horizontal: 3),
             child: AnimatedContainer(
               duration: const Duration(milliseconds: 220),
               curve: Curves.easeOut,
