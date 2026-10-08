@@ -542,6 +542,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool _hasPermission = false;
   bool _dockRunning = false;
   bool _busy = false;
+  String? _error;
 
   @override
   void initState() {
@@ -607,7 +608,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _showDock() async {
-    await _saveSettings(); // the overlay reads the side from here
+    // The overlay reads side + height from here and positions itself.
+    _offset = _offset.clamp(-_maxOffset, _maxOffset);
+    await _saveSettings();
     await FlutterOverlayWindow.showOverlay(
       width: Dock.handleWidth,
       height: Dock.handleHeight,
@@ -617,7 +620,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       // Pinned flush to the edge: no free dragging, no half-hidden snapping.
       enableDrag: false,
       positionGravity: PositionGravity.none,
-      startPosition: OverlayPosition(0, _offset.clamp(-_maxOffset, _maxOffset)),
       flag: OverlayFlag.defaultFlag, // touches outside pass through
       visibility: NotificationVisibility.visibilityPublic,
       overlayTitle: 'Volume Dock',
@@ -627,10 +629,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Future<void> _withBusy(Future<void> Function() action) async {
     if (_busy) return;
-    setState(() => _busy = true);
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
     try {
       await action();
       await Future<void>.delayed(const Duration(milliseconds: 300));
+    } catch (e) {
+      if (mounted) setState(() => _error = 'Could not start the handle: $e');
     } finally {
       await _refreshStatus();
       if (mounted) setState(() => _busy = false);
@@ -751,6 +758,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 tonal: _dockRunning,
                 busy: _busy,
                 onPressed: _toggleDock,
+              ),
+            if (_error != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 12),
+                child: SelectableText(
+                  _error!,
+                  style: const TextStyle(color: Dock.warn, fontSize: 12),
+                ),
               ),
             const SizedBox(height: 20),
 
@@ -1024,18 +1039,32 @@ class _VolumeOverlayState extends State<VolumeOverlay> {
   DockSide _side = DockSide.right;
   bool _expanded = false;
   bool _resizing = false;
+  bool _pulse = true; // glow briefly on start so the handle is easy to spot
   Timer? _idleTimer;
 
   @override
   void initState() {
     super.initState();
     FlutterVolumeController.updateShowSystemUI(false);
-    _loadSide();
+    _loadSettings();
+    Timer(const Duration(milliseconds: 1600), () {
+      if (mounted) setState(() => _pulse = false);
+    });
   }
 
-  Future<void> _loadSide() async {
+  Future<void> _loadSettings() async {
     final s = await DockSettings.load();
-    if (mounted) setState(() => _side = s.side);
+    if (!mounted) return;
+    setState(() => _side = s.side);
+    // Only move when a custom height was chosen; otherwise stay centred on
+    // the edge, which is where the window opens by default.
+    if (s.offset.abs() > 1) {
+      try {
+        await FlutterOverlayWindow.moveOverlay(OverlayPosition(0, s.offset));
+      } catch (_) {
+        // If moving fails, the handle simply stays in the middle.
+      }
+    }
   }
 
   @override
@@ -1156,7 +1185,11 @@ class _VolumeOverlayState extends State<VolumeOverlay> {
                 : Align(
                     key: const ValueKey('handle'),
                     alignment: edge,
-                    child: _EdgeHandle(side: _side, onOpen: _open),
+                    child: _EdgeHandle(
+                      side: _side,
+                      highlight: _pulse,
+                      onOpen: _open,
+                    ),
                   ),
           );
         },
@@ -1167,10 +1200,15 @@ class _VolumeOverlayState extends State<VolumeOverlay> {
 
 /// The thin translucent bar on the screen edge. Swipe inward or tap.
 class _EdgeHandle extends StatefulWidget {
-  const _EdgeHandle({required this.side, required this.onOpen});
+  const _EdgeHandle({
+    required this.side,
+    required this.onOpen,
+    this.highlight = false,
+  });
 
   final DockSide side;
   final VoidCallback onOpen;
+  final bool highlight;
 
   @override
   State<_EdgeHandle> createState() => _EdgeHandleState();
@@ -1188,6 +1226,7 @@ class _EdgeHandleState extends State<_EdgeHandle> {
   @override
   Widget build(BuildContext context) {
     final onRight = widget.side == DockSide.right;
+    final lit = _active || widget.highlight;
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onTapDown: (_) => _setActive(true),
@@ -1219,15 +1258,15 @@ class _EdgeHandleState extends State<_EdgeHandle> {
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 4),
             child: AnimatedContainer(
-              duration: const Duration(milliseconds: 150),
+              duration: const Duration(milliseconds: 220),
               curve: Curves.easeOut,
-              width: _active ? 7 : 5,
-              height: _active ? 104 : 92,
+              width: lit ? 8 : 6,
+              height: lit ? 108 : 96,
               decoration: BoxDecoration(
-                color: _active ? const Color(0xD9FFFFFF) : const Color(0x8CFFFFFF),
+                color: lit ? Dock.accent : const Color(0xB3FFFFFF),
                 borderRadius: BorderRadius.circular(4),
-                // A faint dark outline keeps it visible on white screens.
-                border: Border.all(color: const Color(0x33000000), width: 0.5),
+                // A dark outline keeps it visible on white screens too.
+                border: Border.all(color: const Color(0x59000000), width: 0.8),
               ),
             ),
           ),
