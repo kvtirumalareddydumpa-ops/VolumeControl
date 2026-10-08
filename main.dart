@@ -14,6 +14,7 @@ import 'dart:math' as math;
 
 import 'package:android_intent_plus/android_intent.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/physics.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_overlay_window/flutter_overlay_window.dart';
 import 'package:flutter_volume_controller/flutter_volume_controller.dart';
@@ -866,9 +867,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   Text('Using the handle', style: text.titleSmall),
                   const SizedBox(height: 10),
                   const _Tip('Swipe inward from the handle, or tap it, to '
-                      'open the panel.'),
-                  const _Tip('Swipe the panel back toward the edge to close '
-                      'it. It also closes by itself after 5 seconds.'),
+                      'open the panel. It follows your finger.'),
+                  const _Tip('Tap anywhere outside the panel, or swipe it '
+                      'back toward the edge, to close it.'),
                   const _Tip('The power icon in the panel turns the handle '
                       'off.'),
                   const SizedBox(height: 14),
@@ -1028,6 +1029,14 @@ class _Tip extends StatelessWidget {
 // ═══════════════════════════════════════════════════════════════════════════
 //  PART 2 — Overlay UI: edge handle ⇄ translucent sound panel
 // ═══════════════════════════════════════════════════════════════════════════
+//
+// How it works:
+//  • Closed: the overlay window is just the handle (small, at the edge).
+//  • The moment you touch to open, the window becomes full-screen and
+//    transparent. Everything after that — the panel following your finger,
+//    the spring, the dimmed backdrop — is pure Flutter animation, so it's
+//    smooth. Tapping the backdrop closes it.
+//  • When the panel is fully closed, the window shrinks back to the handle.
 
 class VolumeOverlay extends StatefulWidget {
   const VolumeOverlay({super.key});
@@ -1036,23 +1045,40 @@ class VolumeOverlay extends StatefulWidget {
   State<VolumeOverlay> createState() => _VolumeOverlayState();
 }
 
-class _VolumeOverlayState extends State<VolumeOverlay> {
-  static const _autoHideAfter = Duration(seconds: 5);
+class _VolumeOverlayState extends State<VolumeOverlay>
+    with SingleTickerProviderStateMixin {
+  static const _autoCloseAfter = Duration(seconds: 6);
+
+  // Fast, near-critically damped spring: quick to settle, no wobble.
+  static final _spring = SpringDescription.withDampingRatio(
+    mass: 1,
+    stiffness: 520,
+    ratio: 0.92,
+  );
 
   final MixerController _mixer = MixerController();
+
+  /// 0 = panel fully hidden, 1 = fully open. Drives every animation.
+  late final AnimationController _reveal = AnimationController(vsync: this);
+
   DockSide _side = DockSide.right;
-  bool _expanded = false;
-  bool _resizing = false;
-  bool _pulse = true; // glow briefly on start so the handle is easy to spot
-  Timer? _idleTimer;
+  double _offset = 0; // handle height, dp from screen centre
 
   /// The window's real size in dp, as Flutter sees it.
   Size _window = Size.zero;
 
-  /// Multiplier from dp to whatever unit resizeOverlay/moveOverlay expect.
-  /// 1.0 if the plugin takes dp, the pixel ratio (~2.75 on a realme X3)
-  /// if it takes raw pixels. Measured on start rather than guessed.
+  /// dp → unit the plugin's resize/move expects (1.0 = dp, ~2.75 = pixels).
   double _unit = 1.0;
+
+  bool _ready = false; // calibration finished
+  bool _handleHidden = true; // hidden while the window changes shape
+  bool _pulse = true; // glow on start so the handle is easy to spot
+  bool _exiting = false;
+  Future<void>? _entering;
+  Timer? _idleTimer;
+
+  bool get _onRight => _side == DockSide.right;
+  bool get _isFull => _window.width >= Dock.panelWidth + 24;
 
   @override
   void initState() {
@@ -1061,50 +1087,63 @@ class _VolumeOverlayState extends State<VolumeOverlay> {
     WidgetsBinding.instance.addPostFrameCallback((_) => _setUp());
   }
 
+  @override
+  void dispose() {
+    _idleTimer?.cancel();
+    _reveal.dispose();
+    _mixer.dispose();
+    super.dispose();
+  }
+
+  // ── Start-up ─────────────────────────────────────────────────────────────
+
   Future<void> _setUp() async {
     final s = await DockSettings.load();
-    if (mounted) setState(() => _side = s.side);
-
+    _side = s.side;
+    _offset = s.offset;
     await _calibrate();
-
-    // Only move when a custom height was chosen; otherwise stay centred on
-    // the edge, which is where the window opens by default.
-    if (s.offset.abs() > 1) {
-      try {
-        await FlutterOverlayWindow.moveOverlay(
-          OverlayPosition(0, s.offset * _unit),
-        );
-      } catch (_) {
-        // If moving fails, the handle simply stays in the middle.
-      }
-    }
-
+    await _resizeTo(Dock.handleWidth, Dock.handleHeight);
+    await _moveToOffset();
+    if (!mounted) return;
+    setState(() {
+      _ready = true;
+      _handleHidden = false;
+    });
     Timer(const Duration(milliseconds: 1600), () {
       if (mounted) setState(() => _pulse = false);
     });
   }
 
-  /// Ask for the handle size in dp, see what size we actually get, and
-  /// work out the plugin's unit from the difference.
+  /// Resize to a probe height that differs from the current one, wait for
+  /// Flutter to see the new size, and derive the plugin's unit from it.
   Future<void> _calibrate() async {
+    const probe = 200;
+    final before = _window.height;
     try {
-      await FlutterOverlayWindow.resizeOverlay(
-        Dock.handleWidth,
-        Dock.handleHeight,
-        false,
+      await FlutterOverlayWindow.resizeOverlay(Dock.handleWidth, probe, false);
+      final changed = await _waitFor(
+        () => (_window.height - before).abs() > 2,
+        timeout: const Duration(milliseconds: 1500),
       );
-      // Wait (up to ~1s) for the new size to reach Flutter.
-      for (var i = 0; i < 10; i++) {
-        await Future<void>.delayed(const Duration(milliseconds: 100));
-        if ((_window.height - Dock.handleHeight).abs() < 4) return; // dp
-      }
-      if (_window.height > 1) {
-        _unit = Dock.handleHeight / _window.height; // pixels
-        await _resizeTo(Dock.handleWidth, Dock.handleHeight);
+      if (changed && _window.height > 1) {
+        _unit = probe / _window.height; // ≈1 for dp, ≈pixel ratio for px
+        if ((_unit - 1).abs() < 0.08) _unit = 1;
       }
     } catch (_) {
-      // Keep whatever size we have; better than no handle at all.
+      // Keep 1.0 and carry on; better a handle than none.
     }
+  }
+
+  Future<bool> _waitFor(
+    bool Function() test, {
+    Duration timeout = const Duration(milliseconds: 900),
+  }) async {
+    final end = DateTime.now().add(timeout);
+    while (DateTime.now().isBefore(end)) {
+      if (test()) return true;
+      await Future<void>.delayed(const Duration(milliseconds: 16));
+    }
+    return test();
   }
 
   Future<void> _resizeTo(int widthDp, int heightDp) =>
@@ -1114,45 +1153,89 @@ class _VolumeOverlayState extends State<VolumeOverlay> {
         false,
       );
 
-  @override
-  void dispose() {
-    _idleTimer?.cancel();
-    _mixer.dispose();
-    super.dispose();
-  }
-
-  // Read the levels, grow the window inward from the edge, then show the
-  // panel inside it.
-  Future<void> _open() async {
-    if (_expanded || _resizing) return;
-    _resizing = true;
-    HapticFeedback.lightImpact();
+  Future<void> _moveToOffset() async {
+    if (_offset.abs() <= 1) return;
     try {
-      await _mixer.refresh();
-      await _resizeTo(Dock.panelWidth, Dock.panelHeight);
-      if (!mounted) return;
-      setState(() => _expanded = true);
-      _mixer.startPolling();
-      _armIdleTimer();
-    } finally {
-      _resizing = false;
-    }
+      await FlutterOverlayWindow.moveOverlay(
+        OverlayPosition(0, _offset * _unit),
+      );
+    } catch (_) {}
   }
 
-  // Slide the panel out first, then shrink the window back to the handle.
-  Future<void> _hide() async {
-    if (!_expanded || _resizing) return;
-    _resizing = true;
+  Size _screenDp() {
+    final displays = WidgetsBinding.instance.platformDispatcher.displays;
+    if (displays.isNotEmpty) {
+      final d = displays.first;
+      return d.size / d.devicePixelRatio;
+    }
+    return const Size(400, 900);
+  }
+
+  // ── Window shape changes ─────────────────────────────────────────────────
+
+  /// Make the window full-screen (only once, even if called repeatedly).
+  Future<void> _enterFull() => _entering ??= _doEnterFull();
+
+  Future<void> _doEnterFull() async {
+    if (_isFull) return;
+    _mixer.refresh(); // don't wait for it; never block the animation
+    _mixer.startPolling();
+    try {
+      if (_offset.abs() > 1) {
+        await FlutterOverlayWindow.moveOverlay(OverlayPosition(0, 0));
+      }
+      final screen = _screenDp();
+      await _resizeTo(screen.width.ceil(), screen.height.ceil());
+      if (!await _waitFor(() => _isFull)) {
+        // Fallback: ask for "match parent" if the explicit size didn't take.
+        await FlutterOverlayWindow.resizeOverlay(-1, -1, false);
+        await _waitFor(() => _isFull);
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _exitFull() async {
+    if (_exiting) return;
+    _exiting = true;
     _idleTimer?.cancel();
     _mixer.stopPolling();
+    setState(() => _handleHidden = true);
     try {
-      setState(() => _expanded = false);
-      await Future<void>.delayed(const Duration(milliseconds: 240));
       await _resizeTo(Dock.handleWidth, Dock.handleHeight);
-    } finally {
-      _resizing = false;
+      await _moveToOffset();
+      await Future<void>.delayed(const Duration(milliseconds: 60));
+    } catch (_) {}
+    _entering = null;
+    _exiting = false;
+    if (mounted) setState(() => _handleHidden = false);
+  }
+
+  // ── Open / close ─────────────────────────────────────────────────────────
+
+  Future<void> _settle(double target, {double velocity = 0}) async {
+    if (target == 1) {
+      await _enterFull();
+      if (!_isFull) return _exitFull(); // couldn't grow; stay closed
+    }
+    _idleTimer?.cancel();
+    await _reveal.animateWith(
+      SpringSimulation(_spring, _reveal.value, target, velocity),
+    );
+    if (!mounted) return;
+    if (target == 0) {
+      await _exitFull();
+    } else {
+      _armIdleTimer();
     }
   }
+
+  void _open() {
+    if (!_ready || _exiting) return;
+    HapticFeedback.lightImpact();
+    _settle(1);
+  }
+
+  void _close() => _settle(0);
 
   Future<void> _turnOff() async {
     _idleTimer?.cancel();
@@ -1162,10 +1245,10 @@ class _VolumeOverlayState extends State<VolumeOverlay> {
 
   void _armIdleTimer() {
     _idleTimer?.cancel();
-    _idleTimer = Timer(_autoHideAfter, _hide);
+    _idleTimer = Timer(_autoCloseAfter, _close);
   }
 
-  void _onActivity(bool active) {
+  void _onSliderActivity(bool active) {
     if (active) {
       _idleTimer?.cancel();
     } else {
@@ -1173,81 +1256,161 @@ class _VolumeOverlayState extends State<VolumeOverlay> {
     }
   }
 
+  // ── Swipe: the panel tracks the finger, then springs open or shut ────────
+
+  bool _swiping = false;
+  bool _crossedHalf = false;
+
+  void _onSwipeStart(DragStartDetails d) {
+    if (!_ready || _exiting) return;
+    _swiping = true;
+    _crossedHalf = _reveal.value > 0.5;
+    _reveal.stop();
+    _idleTimer?.cancel();
+    _enterFull();
+  }
+
+  void _onSwipeUpdate(DragUpdateDetails d) {
+    if (!_swiping) return;
+    final dx = d.delta.dx;
+    // Ignore the one-off jump when the window changes shape mid-swipe.
+    if (dx.abs() > 80) return;
+    final inward = _onRight ? -dx : dx;
+    _reveal.value =
+        (_reveal.value + inward / Dock.panelWidth).clamp(0.0, 1.0);
+    final half = _reveal.value > 0.5;
+    if (half != _crossedHalf) {
+      _crossedHalf = half;
+      HapticFeedback.selectionClick();
+    }
+  }
+
+  void _onSwipeEnd(DragEndDetails? d) {
+    if (!_swiping) return;
+    _swiping = false;
+    final vx = d?.primaryVelocity ?? 0;
+    final inwardV = _onRight ? -vx : vx; // dp per second, + means opening
+    final double target;
+    if (inwardV > 350) {
+      target = 1;
+    } else if (inwardV < -350) {
+      target = 0;
+    } else {
+      target = _reveal.value > 0.4 ? 1 : 0;
+    }
+    _settle(target, velocity: inwardV / Dock.panelWidth);
+  }
+
+  // ── UI ───────────────────────────────────────────────────────────────────
+
   @override
   Widget build(BuildContext context) {
-    final edge = _side == DockSide.right
-        ? Alignment.centerRight
-        : Alignment.centerLeft;
-
     return Material(
       type: MaterialType.transparency,
       child: LayoutBuilder(
         builder: (context, constraints) {
           _window = constraints.biggest;
-          // Only show the panel once the window has actually grown, so it
-          // never renders squashed during the resize.
-          final showPanel = _expanded &&
-              constraints.maxWidth >= Dock.panelWidth * 0.85 &&
-              constraints.maxHeight >= Dock.panelHeight * 0.85;
-
-          return AnimatedSwitcher(
-            duration: const Duration(milliseconds: 240),
-            switchInCurve: Curves.easeOutCubic,
-            switchOutCurve: Curves.easeInCubic,
-            layoutBuilder: (current, previous) => Stack(
-              alignment: edge,
-              children: [...previous, if (current != null) current],
-            ),
-            transitionBuilder: (child, anim) {
-              final dx = _side == DockSide.right ? 0.2 : -0.2;
-              return FadeTransition(
-                opacity: anim,
-                child: SlideTransition(
-                  position: Tween<Offset>(
-                    begin: Offset(dx, 0),
-                    end: Offset.zero,
-                  ).animate(anim),
-                  child: child,
-                ),
-              );
-            },
-            child: showPanel
-                ? SizedBox.expand(
-                    key: const ValueKey('panel'),
-                    child: _SoundPanel(
-                      mixer: _mixer,
-                      side: _side,
-                      onActivity: _onActivity,
-                      onHide: _hide,
-                      onTurnOff: _turnOff,
-                    ),
-                  )
-                : Align(
-                    key: const ValueKey('handle'),
-                    alignment: edge,
-                    child: _EdgeHandle(
-                      side: _side,
-                      highlight: _pulse,
-                      onOpen: _open,
-                    ),
-                  ),
+          return GestureDetector(
+            behavior: HitTestBehavior.translucent,
+            onHorizontalDragStart: _onSwipeStart,
+            onHorizontalDragUpdate: _onSwipeUpdate,
+            onHorizontalDragEnd: _onSwipeEnd,
+            onHorizontalDragCancel: () => _onSwipeEnd(null),
+            child: _isFull ? _buildFull(constraints.biggest) : _buildHandleOnly(),
           );
         },
       ),
     );
   }
+
+  Widget _handle() => AnimatedOpacity(
+        opacity: _handleHidden ? 0 : 1,
+        duration: const Duration(milliseconds: 140),
+        child: _EdgeHandle(side: _side, highlight: _pulse, onTap: _open),
+      );
+
+  Widget _buildHandleOnly() => Align(
+        alignment: _onRight ? Alignment.centerRight : Alignment.centerLeft,
+        child: _handle(),
+      );
+
+  Widget _buildFull(Size size) {
+    final h = size.height;
+    final handleTop = h / 2 + _offset - Dock.handleHeight / 2;
+    final maxTop = math.max(32.0, h - Dock.panelHeight - 32);
+    final panelTop =
+        (h / 2 + _offset - Dock.panelHeight / 2).clamp(32.0, maxTop);
+    final travel = Dock.panelWidth + 24.0;
+
+    return Stack(
+      children: [
+        // Dimmed backdrop: tap anywhere outside the panel to close.
+        Positioned.fill(
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: _close,
+            child: AnimatedBuilder(
+              animation: _reveal,
+              builder: (context, _) => ColoredBox(
+                color: Color.fromRGBO(0, 0, 0, 0.32 * _reveal.value),
+              ),
+            ),
+          ),
+        ),
+        // The handle stays put underneath, fading as the panel comes in.
+        Positioned(
+          top: handleTop,
+          right: _onRight ? 0 : null,
+          left: _onRight ? null : 0,
+          child: AnimatedBuilder(
+            animation: _reveal,
+            builder: (context, child) => Opacity(
+              opacity: (1 - _reveal.value * 3).clamp(0.0, 1.0),
+              child: child,
+            ),
+            child: _handle(),
+          ),
+        ),
+        // The panel slides in from the edge, tracking the finger.
+        Positioned(
+          top: panelTop,
+          right: _onRight ? 10 : null,
+          left: _onRight ? null : 10,
+          width: Dock.panelWidth.toDouble(),
+          height: Dock.panelHeight.toDouble(),
+          child: AnimatedBuilder(
+            animation: _reveal,
+            builder: (context, child) {
+              final v = _reveal.value;
+              return Transform.translate(
+                offset: Offset((_onRight ? 1 : -1) * (1 - v) * travel, 0),
+                child: child,
+              );
+            },
+            child: RepaintBoundary(
+              child: _SoundPanel(
+                mixer: _mixer,
+                onActivity: _onSliderActivity,
+                onTurnOff: _turnOff,
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
 }
 
-/// The thin translucent bar on the screen edge. Swipe inward or tap.
+/// The thin translucent bar on the screen edge.
 class _EdgeHandle extends StatefulWidget {
   const _EdgeHandle({
     required this.side,
-    required this.onOpen,
+    required this.onTap,
     this.highlight = false,
   });
 
   final DockSide side;
-  final VoidCallback onOpen;
+  final VoidCallback onTap;
   final bool highlight;
 
   @override
@@ -1255,41 +1418,24 @@ class _EdgeHandle extends StatefulWidget {
 }
 
 class _EdgeHandleState extends State<_EdgeHandle> {
-  double _dx = 0;
-  bool _active = false;
-  bool _fired = false;
+  bool _pressed = false;
 
-  void _setActive(bool v) {
-    if (_active != v) setState(() => _active = v);
+  void _set(bool v) {
+    if (_pressed != v) setState(() => _pressed = v);
   }
 
   @override
   Widget build(BuildContext context) {
     final onRight = widget.side == DockSide.right;
-    final lit = _active || widget.highlight;
+    final lit = _pressed || widget.highlight;
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
-      onTapDown: (_) => _setActive(true),
-      onTapCancel: () => _setActive(false),
+      onTapDown: (_) => _set(true),
+      onTapCancel: () => _set(false),
       onTap: () {
-        _setActive(false);
-        widget.onOpen();
+        _set(false);
+        widget.onTap();
       },
-      onHorizontalDragStart: (_) {
-        _dx = 0;
-        _fired = false;
-        _setActive(true);
-      },
-      onHorizontalDragUpdate: (d) {
-        _dx += d.delta.dx;
-        final inward = onRight ? -_dx : _dx;
-        if (!_fired && inward > 10) {
-          _fired = true;
-          widget.onOpen();
-        }
-      },
-      onHorizontalDragEnd: (_) => _setActive(false),
-      onHorizontalDragCancel: () => _setActive(false),
       child: SizedBox(
         width: Dock.handleWidth.toDouble(),
         height: Dock.handleHeight.toDouble(),
@@ -1298,8 +1444,8 @@ class _EdgeHandleState extends State<_EdgeHandle> {
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 3),
             child: AnimatedContainer(
-              duration: const Duration(milliseconds: 220),
-              curve: Curves.easeOut,
+              duration: const Duration(milliseconds: 160),
+              curve: Curves.easeOutCubic,
               width: lit ? 8 : 6,
               height: lit ? 108 : 96,
               decoration: BoxDecoration(
@@ -1320,84 +1466,64 @@ class _EdgeHandleState extends State<_EdgeHandle> {
 class _SoundPanel extends StatelessWidget {
   const _SoundPanel({
     required this.mixer,
-    required this.side,
     required this.onActivity,
-    required this.onHide,
     required this.onTurnOff,
   });
 
   final MixerController mixer;
-  final DockSide side;
   final ValueChanged<bool> onActivity;
-  final VoidCallback onHide;
   final VoidCallback onTurnOff;
 
   @override
   Widget build(BuildContext context) {
-    final onRight = side == DockSide.right;
-    return GestureDetector(
-      // Fling the panel back toward its edge to close it.
-      onHorizontalDragEnd: (d) {
-        final v = d.primaryVelocity ?? 0;
-        if ((onRight && v > 250) || (!onRight && v < -250)) onHide();
-      },
-      child: Container(
-        margin: EdgeInsets.only(left: onRight ? 0 : 8, right: onRight ? 8 : 0),
-        padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
-        decoration: BoxDecoration(
-          color: Dock.glass,
-          borderRadius: BorderRadius.circular(28),
-          border: Border.all(color: Dock.stroke),
-        ),
-        child: Column(
-          children: [
-            Row(
-              children: [
-                const Text(
-                  'Sound',
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontSize: 15,
-                    fontWeight: FontWeight.w600,
-                  ),
+    return Container(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+      decoration: BoxDecoration(
+        color: Dock.glass,
+        borderRadius: BorderRadius.circular(28),
+        border: Border.all(color: Dock.stroke),
+      ),
+      child: Column(
+        children: [
+          Row(
+            children: [
+              const Text(
+                'Sound',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 15,
+                  fontWeight: FontWeight.w600,
                 ),
-                const Spacer(),
-                _TinyIcon(
-                  icon: Icons.power_settings_new_rounded,
-                  onTap: onTurnOff,
-                ),
-                const SizedBox(width: 4),
-                _TinyIcon(
-                  icon: onRight
-                      ? Icons.chevron_right_rounded
-                      : Icons.chevron_left_rounded,
-                  onTap: onHide,
-                ),
-              ],
-            ),
-            ListenableBuilder(
-              listenable: mixer,
-              builder: (context, _) => mixer.notice == null
-                  ? const SizedBox(height: 10)
-                  : Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 6),
-                      child: Text(
-                        mixer.notice!,
-                        maxLines: 2,
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(color: Dock.warn, fontSize: 11),
-                      ),
-                    ),
-            ),
-            Expanded(
-              child: MixerRow(
-                mixer: mixer,
-                sliderWidth: 50,
-                onActivity: onActivity,
               ),
+              const Spacer(),
+              _TinyIcon(
+                icon: Icons.power_settings_new_rounded,
+                onTap: onTurnOff,
+              ),
+            ],
+          ),
+          ListenableBuilder(
+            listenable: mixer,
+            builder: (context, _) => mixer.notice == null
+                ? const SizedBox(height: 10)
+                : Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 6),
+                    child: Text(
+                      mixer.notice!,
+                      maxLines: 2,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(color: Dock.warn, fontSize: 11),
+                    ),
+                  ),
+          ),
+          Expanded(
+            child: MixerRow(
+              mixer: mixer,
+              sliderWidth: 50,
+              onActivity: onActivity,
             ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
